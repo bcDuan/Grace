@@ -1,0 +1,21 @@
+# Install PyTorch + PyG FIRST (see README and scripts/install_torch_pyg.sh).
+# Then: pip install -r requirements.txt
+
+sentence-transformers==2.7.0
+transformers==4.44.0
+accelerate
+rank-bm25
+networkx>=3.2
+scipy
+# PyTorch 2.1 wheels are built against NumPy 1.x; avoid 2.x ABI warnings/crashes.
+numpy>=1.26,<2
+pandas
+tqdm
+pyyaml
+python-dotenv
+openai
+datasets
+huggingface-hub
+matplotlib
+pytest
+ruff

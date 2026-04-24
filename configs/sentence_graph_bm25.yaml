@@ -1,0 +1,5 @@
+experiment: sentence_graph_bm25
+graph_kind: sentence_graph
+retriever: bm25
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json

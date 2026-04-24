@@ -1,0 +1,5 @@
+experiment: entity_kg_sbert
+graph_kind: entity_kg
+retriever: sbert
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json

@@ -1,0 +1,5 @@
+experiment: sentence_graph_sbert
+graph_kind: sentence_graph
+retriever: sbert
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json

@@ -1,0 +1,7 @@
+experiment: entity_kg_gnn
+graph_kind: entity_kg
+retriever: gnn
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json
+training:
+  checkpoint: experiments/checkpoints/entity_kg_gnn.pt

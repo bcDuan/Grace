@@ -1,0 +1,7 @@
+experiment: sentence_graph_gnn
+graph_kind: sentence_graph
+retriever: gnn
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json
+training:
+  checkpoint: experiments/checkpoints/sentence_graph_gnn.pt

@@ -1,0 +1,60 @@
+# Default GRACE configuration (override per-experiment YAML)
+
+project:
+  name: grace
+  seed: 42
+
+data:
+  longmemeval_s_json: data/raw/longmemeval/longmemeval_s.json
+  locomo_json: data/raw/locomo10.json
+  train_ratio: 0.8
+  # graph kind: entity_kg | sentence_graph
+  graph_kind: sentence_graph
+
+retrieval:
+  sbert_model: sentence-transformers/all-MiniLM-L6-v2
+  bm25_tokenizer: simple_whitespace
+  ppr:
+    alpha: 0.15
+    max_iter: 100
+    tol: 1.0e-6
+
+gnn:
+  in_dim: 384
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.2
+  lam: 0.5
+  neg_ratio: 5
+  infonce_temperature: 0.1
+
+training:
+  epochs: 25
+  batch_size: 8
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+eval:
+  recall_ks: [1, 3, 5, 10, 20]
+
+qa:
+  backend: vllm
+  model: Qwen/Qwen2.5-7B-Instruct
+  batch_size: 16
+  max_new_tokens: 256
+  temperature: 0.0
+  gpu_memory_utilization: 0.85
+  use_judge: true
+
+judge:
+  backend: siliconflow
+  model_tier: strong
+  concurrent_requests: 10
+  cache_dir: data/processed/judge_cache
+  max_retries: 3
+
+paths:
+  artifacts: artifacts
+  checkpoints: experiments/checkpoints
+  results: experiments/results

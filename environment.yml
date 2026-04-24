@@ -1,0 +1,18 @@
+# 1) conda env create -f environment.yml && conda activate grace
+# 2) bash scripts/install_torch_pyg.sh
+# 3) pip install -e .   (from this directory)
+name: grace
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - pyyaml
+  - python-dotenv
+  - tqdm
+  - networkx
+  - pip:
+    - -r requirements.txt

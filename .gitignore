@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+.venv/
+venv/
+env/
+
+# Conda
+.conda/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+.env
+data/raw/**
+!data/raw/.gitkeep
+!data/raw/longmemeval/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+data/graphs/**
+!data/graphs/.gitkeep
+third_party/**
+!third_party/.gitkeep
+experiments/logs/**
+!experiments/logs/.gitkeep
+experiments/checkpoints/**
+!experiments/checkpoints/.gitkeep
+experiments/results/**
+!experiments/results/.gitkeep
+artifacts/**
+!artifacts/.gitkeep
+checkpoints/**
+!checkpoints/.gitkeep
+wandb/
+*.pt
+*.pth
+*.pkl
+*.pickle
+
+# Notebooks
+.ipynb_checkpoints/
