@@ -12,12 +12,13 @@ from pathlib import Path
 from grace.datasets.longmemeval import LongMemSample, load_longmemeval_s
 from grace.eval.retrieval_metrics import hit_at_k, mrr, recall_at_k, session_recall_at_k
 from grace.graphs.build import build_sentence_graph
-from grace.qa.judge import LLMJudge
+from grace.qa.judge import LLMJudge, PRICE_PER_1M_CNY
 from grace.qa.reader import QwenReader
 from grace.retrievers.bm25 import BM25Retriever
 from grace.retrievers.gnn import GNNRetriever
 from grace.retrievers.ppr import PPRRetriever
 from grace.retrievers.sbert import SBERTRetriever
+from tqdm import tqdm
 
 
 def stratified_sample(samples: list[LongMemSample], limit: int, seed: int = 42) -> list[LongMemSample]:
@@ -158,6 +159,12 @@ def main() -> None:
     subset = stratified_sample(evalable, args.limit, seed=args.seed)
     if not subset:
         raise SystemExit("No evaluable samples.")
+    est_judge_tokens = len(subset) * 350
+    est_judge_cost = (est_judge_tokens / 1_000_000.0) * PRICE_PER_1M_CNY[args.judge_backend]["strong"]
+    print(
+        f"[cost-estimate] retriever={args.retriever} n={len(subset)} "
+        f"judge_upper_bound_cny={est_judge_cost:.4f} (assume 350 tokens/sample, no cache)"
+    )
 
     sbert_model = args.sbert_model
     if args.sbert_local_only:
@@ -209,7 +216,7 @@ def main() -> None:
     t_retr_start = time.time()
     retrieved_ids: list[list[int]] = []
     contexts: list[list[dict]] = []
-    for s in subset:
+    for s in tqdm(subset, desc=f"[{args.retriever}] retrieve", unit="q"):
         ids, ctx = _retrieve_one(
             s,
             args.retriever,
@@ -235,7 +242,7 @@ def main() -> None:
     questions = [s.question for s in subset]
     preds: list[str] = []
     bs = max(1, args.reader_batch_size)
-    for i in range(0, len(questions), bs):
+    for i in tqdm(range(0, len(questions), bs), desc=f"[{args.retriever}] reader", unit="batch"):
         preds.extend(reader.answer_batch(questions[i : i + bs], contexts[i : i + bs]))
     t_reader = time.time() - t_reader_start
 

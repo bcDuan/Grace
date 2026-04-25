@@ -34,7 +34,7 @@ def collate(batch):
     return batch
 
 
-def train_one_epoch(model, loader, opt, device, lam: float) -> float:
+def train_one_epoch(model, loader, opt, device, lam: float, neg_ratio: int) -> float:
     model.train()
     total, n = 0.0, 0
     for batch in loader:
@@ -45,7 +45,7 @@ def train_one_epoch(model, loader, opt, device, lam: float) -> float:
             x, edge_index = x.to(device), edge_index.to(device)
             q, pos_mask = q.to(device), pos_mask.to(device)
             logits = model(x, edge_index, q)
-            loss = loss + combined_loss(logits, pos_mask, lam=lam)
+            loss = loss + combined_loss(logits, pos_mask, lam=lam, neg_ratio=neg_ratio)
             m += 1
         if m == 0:
             continue
@@ -206,13 +206,18 @@ def main() -> None:
     p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lam", type=float, default=0.5)
+    p.add_argument("--neg_ratio", type=int, default=4, help="Negative sampling ratio for BCE.")
     p.add_argument("--out", default="experiments/checkpoints/gnn.pt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--topk_graph", type=int, default=5)
     p.add_argument("--sbert", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--val_limit", type=int, default=30)
     p.add_argument("--val_seed", type=int, default=42)
-    p.add_argument("--save_every_epoch", action="store_true")
+    p.add_argument(
+        "--checkpoint_pattern",
+        default="experiments/checkpoints/gnn_epoch{ep}.pt",
+        help="Checkpoint path pattern saved at every epoch.",
+    )
     p.add_argument("--reader_backend", choices=("vllm", "transformers"), default="transformers")
     p.add_argument("--reader_model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--reader_batch_size", type=int, default=2)
@@ -275,74 +280,18 @@ def main() -> None:
     judge = LLMJudge(backend=args.judge_backend, cache_dir=args.judge_cache_dir)
     best_metric = -1.0
     best_epoch = -1
-    best_acc = 0.0
-    best_path = Path("experiments/checkpoints/gnn_best.pt")
-    best_path.parent.mkdir(parents=True, exist_ok=True)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_preview = Path(args.checkpoint_pattern.format(ep=1))
+    ckpt_preview.parent.mkdir(parents=True, exist_ok=True)
     t_train0 = time.time()
-    proxy_mode = False
     hist: list[dict] = []
     max_epochs = args.epochs
     epoch = 1
     while epoch <= max_epochs:
-        loss = train_one_epoch(model, train_loader, opt, device, lam=args.lam)
+        loss = train_one_epoch(model, train_loader, opt, device, lam=args.lam, neg_ratio=args.neg_ratio)
         r5 = eval_recall(model, val_loader, device, k=5)
-        val_acc = float("nan")
-        qa_eval_start = time.time()
-        qa_evaluated = False
-        if not proxy_mode:
-            val_acc, val_sess_r5 = eval_qa_accuracy(
-                model=model,
-                val_graphs=val_graphs,
-                sbert=sbert,
-                reader=reader,
-                judge=judge,
-                device=device,
-                k=5,
-                reader_batch_size=args.reader_batch_size,
-            )
-            qa_eval_elapsed = time.time() - qa_eval_start
-            qa_evaluated = True
-            if qa_eval_elapsed > 300.0 and epoch < max_epochs:
-                proxy_mode = True
-                print("[warn] Per-epoch QA eval exceeded 5 min; switching to Recall@5 proxy and evaluating QA on final epoch only.")
-        else:
-            val_sess_r5 = float("nan")
-        metric = val_acc if qa_evaluated else r5
-        if metric > best_metric:
-            best_metric = metric
-            best_epoch = epoch
-            best_acc = val_acc if qa_evaluated else best_acc
-            torch.save(model.state_dict(), best_path)
-            tag = "  (best so far)"
-        else:
-            tag = ""
-        if args.save_every_epoch:
-            ep_path = Path(str(args.out).format(ep=epoch))
-            ep_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), ep_path)
-        print(
-            f"[ep {epoch}/{max_epochs}] train_loss={loss:.3f}  val_R@5={r5:.3f}  "
-            f"val_acc={val_acc if qa_evaluated else float('nan'):.3f}{tag}"
-        )
-        hist.append(
-            {
-                "epoch": epoch,
-                "train_loss": float(loss),
-                "val_R5": float(r5),
-                "val_acc": float(val_acc) if qa_evaluated else None,
-                "qa_eval": bool(qa_evaluated),
-            }
-        )
-        if epoch == args.epochs and best_epoch == args.epochs and max_epochs < 8:
-            max_epochs = min(8, args.epochs + 3)
-            print(f"[info] epoch {args.epochs} is current best; extending training to {max_epochs} epochs.")
-        epoch += 1
-
-    if proxy_mode:
-        print("[warn] Best checkpoint selected by Recall@5 proxy due to QA eval cost.")
-        final_acc, final_sess_r5 = eval_qa_accuracy(
+        val_acc, val_sess_r5 = eval_qa_accuracy(
             model=model,
             val_graphs=val_graphs,
             sbert=sbert,
@@ -352,10 +301,35 @@ def main() -> None:
             k=5,
             reader_batch_size=args.reader_batch_size,
         )
-        print(f"[final QA] val_acc={final_acc:.3f} val_sessR@5={final_sess_r5:.3f}")
-    print(
-        f"BEST: epoch {best_epoch}, val_acc={best_acc:.3f}, saved to {best_path}"
-    )
+        metric = val_acc
+        if metric > best_metric:
+            best_metric = metric
+            best_epoch = epoch
+            tag = "  (best so far)"
+        else:
+            tag = ""
+        ep_path = Path(args.checkpoint_pattern.format(ep=epoch))
+        ep_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), ep_path)
+        print(
+            f"[ep {epoch}/{max_epochs}] train_loss={loss:.3f}  val_R@5={r5:.3f}  "
+            f"val_acc={val_acc:.3f}{tag}"
+        )
+        hist.append(
+            {
+                "epoch": epoch,
+                "train_loss": float(loss),
+                "val_R5": float(r5),
+                "val_acc": float(val_acc),
+                "qa_eval": True,
+            }
+        )
+        if epoch == args.epochs and best_epoch == args.epochs and max_epochs < 8:
+            max_epochs = min(8, args.epochs + 3)
+            print(f"[info] epoch {args.epochs} is current best; extending training to {max_epochs} epochs.")
+        epoch += 1
+
+    print(f"BEST_EPOCH_BY_METRIC: epoch {best_epoch}, metric={best_metric:.3f}")
     curve_path = Path(args.curve_out)
     curve_path.parent.mkdir(parents=True, exist_ok=True)
     curve_path.write_text(
@@ -381,14 +355,20 @@ def main() -> None:
         f"judge_calls={js['total_judge_calls']} judge_cache_hit_rate={js['judge_cache_hit_rate']:.3f} "
         f"judge_est_cost_cny={js['est_cost_cny']}"
     )
-    if best_acc < 0.45:
+    print("\n=== TRAINING CURVE (all epochs) ===")
+    print("epoch\tloss\tval_R@5\tval_acc")
+    for row in hist:
+        val_acc_txt = "nan" if row["val_acc"] is None else f"{row['val_acc']:.3f}"
+        print(f"{row['epoch']}\t{row['train_loss']:.3f}\t{row['val_R5']:.3f}\t{val_acc_txt}")
+    best_acc = max((float(r["val_acc"]) for r in hist if r["val_acc"] is not None), default=float("nan"))
+    if np.isnan(best_acc) or best_acc < 0.45:
         print("[diag] GNN val_acc < 0.45")
         for row in hist:
             print(
                 f"  ep{row['epoch']}: train_loss={row['train_loss']:.3f} val_R@5={row['val_R5']:.3f} "
                 f"val_acc={row['val_acc'] if row['qa_eval'] else float('nan'):.3f}"
             )
-        r5_improved = hist[-1]["val_r5"] > hist[0]["val_r5"]
+        r5_improved = hist[-1]["val_R5"] > hist[0]["val_R5"]
         acc_valid = [h["val_acc"] for h in hist if h["qa_eval"] and not np.isnan(h["val_acc"])]
         acc_improved = len(acc_valid) >= 2 and acc_valid[-1] > acc_valid[0]
         if r5_improved and not acc_improved:
