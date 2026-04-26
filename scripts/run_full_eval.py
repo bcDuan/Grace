@@ -99,6 +99,32 @@ def _minmax(scores: list[float]) -> list[float]:
     return [(s - lo) / (hi - lo) for s in scores]
 
 
+def _select_diverse_by_session(
+    rows: list[tuple[int, float, str]],
+    turn_to_session: dict[int, str],
+    k: int,
+    penalty: float,
+) -> list[tuple[int, float, str]]:
+    """Greedy session-diverse selection over already scored candidate turns."""
+    selected: list[tuple[int, float, str]] = []
+    selected_counts: dict[str, int] = {}
+    remaining = list(rows)
+    while remaining and len(selected) < k:
+        best_pos = 0
+        best_score = float("-inf")
+        for pos, (gid, score, _) in enumerate(remaining):
+            sid = str(turn_to_session.get(gid, "unknown"))
+            adjusted = float(score) - penalty * selected_counts.get(sid, 0)
+            if adjusted > best_score:
+                best_score = adjusted
+                best_pos = pos
+        chosen = remaining.pop(best_pos)
+        selected.append(chosen)
+        sid = str(turn_to_session.get(chosen[0], "unknown"))
+        selected_counts[sid] = selected_counts.get(sid, 0) + 1
+    return selected
+
+
 def _retrieve_one(
     s: LongMemSample,
     retriever: str,
@@ -110,6 +136,7 @@ def _retrieve_one(
     fusion_gnn_weight: float = 0.5,
     fusion_sbert_weight: float = 0.3,
     fusion_bm25_weight: float = 0.2,
+    diversify_session_penalty: float = 0.0,
 ) -> tuple[list[int], list[dict]]:
     texts = [t.text for t in s.turns]
     if retriever == "bm25":
@@ -136,9 +163,9 @@ def _retrieve_one(
         cand_texts = [g.node_texts[i] for i in cand_ids]
         sb_ranked = SBERTRetriever(cand_texts, model_name=sbert_model).retrieve(s.question, k=k)
         r = [(cand_ids[i], score, text) for i, score, text in sb_ranked]
-    elif retriever == "gnn+fusion_rerank":
+    elif retriever in ("gnn+fusion_rerank", "gnn+fusion_diverse_rerank"):
         if gnn_retriever is None:
-            raise ValueError("gnn+fusion_rerank selected but no checkpoint-loaded retriever was provided.")
+            raise ValueError(f"{retriever} selected but no checkpoint-loaded retriever was provided.")
         g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
         pool_k = max(k, rerank_pool)
         gnn_ranked = gnn_retriever.retrieve(
@@ -168,7 +195,16 @@ def _retrieve_one(
                 + fusion_bm25_weight * bm25_scores[local_i]
             )
             fused.append((gid, score, g.node_texts[gid]))
-        r = sorted(fused, key=lambda x: x[1], reverse=True)[:k]
+        ranked = sorted(fused, key=lambda x: x[1], reverse=True)
+        if retriever == "gnn+fusion_diverse_rerank":
+            r = _select_diverse_by_session(
+                ranked,
+                s.turn_to_session,
+                k=k,
+                penalty=diversify_session_penalty,
+            )
+        else:
+            r = ranked[:k]
     else:
         raise ValueError(f"Unsupported retriever: {retriever}")
     ids = [i for i, _, _ in r]
@@ -182,7 +218,15 @@ def main() -> None:
     p.add_argument("--data", default="data/raw/longmemeval/longmemeval_s.json")
     p.add_argument(
         "--retriever",
-        choices=("bm25", "sbert", "ppr", "gnn", "gnn+sbert_rerank", "gnn+fusion_rerank"),
+        choices=(
+            "bm25",
+            "sbert",
+            "ppr",
+            "gnn",
+            "gnn+sbert_rerank",
+            "gnn+fusion_rerank",
+            "gnn+fusion_diverse_rerank",
+        ),
         default="sbert",
     )
     p.add_argument("--checkpoint", default="", help="Required when --retriever gnn")
@@ -190,6 +234,12 @@ def main() -> None:
     p.add_argument("--fusion-gnn-weight", type=float, default=0.5)
     p.add_argument("--fusion-sbert-weight", type=float, default=0.3)
     p.add_argument("--fusion-bm25-weight", type=float, default=0.2)
+    p.add_argument(
+        "--diversify-session-penalty",
+        type=float,
+        default=0.15,
+        help="Score penalty for selecting additional turns from an already selected session.",
+    )
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -223,7 +273,12 @@ def main() -> None:
     if args.sbert_local_only:
         sbert_model = _resolve_local_sbert_model(args.sbert_model)
     gnn_retriever: GNNRetriever | None = None
-    if args.retriever in ("gnn", "gnn+sbert_rerank", "gnn+fusion_rerank"):
+    if args.retriever in (
+        "gnn",
+        "gnn+sbert_rerank",
+        "gnn+fusion_rerank",
+        "gnn+fusion_diverse_rerank",
+    ):
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required when --retriever gnn")
         if args.checkpoint == "random_init":
@@ -281,6 +336,7 @@ def main() -> None:
             fusion_gnn_weight=args.fusion_gnn_weight,
             fusion_sbert_weight=args.fusion_sbert_weight,
             fusion_bm25_weight=args.fusion_bm25_weight,
+            diversify_session_penalty=args.diversify_session_penalty,
         )
         retrieved_ids.append(ids)
         contexts.append(ctx)

@@ -126,3 +126,24 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/run_full_eval.py \
   --judge-cache-dir data/processed/judge_cache \
   --output experiments/results/pairwise_ft_ep8_fusion_n100.json
 ```
+
+## Ablation: Session Diversification
+
+We also tested a graph-guided session diversification variant. After fusion reranking, it greedily selects turns while applying a small penalty to additional turns from already selected sessions. The goal is to improve multi-session coverage.
+
+| Method | QA Acc | SessR@5 | Hit@5 | MRR |
+|---|---:|---:|---:|---:|
+| Fusion rerank | 0.430 | 0.913 | 0.970 | 0.950 |
+| Fusion + session diversification, penalty=0.05 | 0.420 | 0.933 | 0.970 | 0.953 |
+
+Conclusion:
+
+- Session diversification improves session coverage: SessR@5 0.913 -> 0.933.
+- It slightly reduces QA accuracy: 0.430 -> 0.420.
+- Therefore, the non-diverse fusion reranker remains the main method, while diversification is useful as an ablation showing the tradeoff between broader graph coverage and answer-level precision.
+
+Saved ablation result:
+
+```text
+experiments/results/pairwise_ft_ep8_fusion_diverse_p005_n100.json
+```
