@@ -89,6 +89,16 @@ def _build_turn_meta(sample: LongMemSample) -> dict[int, dict]:
     return out
 
 
+def _minmax(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    lo = min(scores)
+    hi = max(scores)
+    if hi <= lo:
+        return [0.0 for _ in scores]
+    return [(s - lo) / (hi - lo) for s in scores]
+
+
 def _retrieve_one(
     s: LongMemSample,
     retriever: str,
@@ -97,6 +107,9 @@ def _retrieve_one(
     sbert_model: str,
     gnn_retriever: GNNRetriever | None = None,
     rerank_pool: int = 20,
+    fusion_gnn_weight: float = 0.5,
+    fusion_sbert_weight: float = 0.3,
+    fusion_bm25_weight: float = 0.2,
 ) -> tuple[list[int], list[dict]]:
     texts = [t.text for t in s.turns]
     if retriever == "bm25":
@@ -123,6 +136,39 @@ def _retrieve_one(
         cand_texts = [g.node_texts[i] for i in cand_ids]
         sb_ranked = SBERTRetriever(cand_texts, model_name=sbert_model).retrieve(s.question, k=k)
         r = [(cand_ids[i], score, text) for i, score, text in sb_ranked]
+    elif retriever == "gnn+fusion_rerank":
+        if gnn_retriever is None:
+            raise ValueError("gnn+fusion_rerank selected but no checkpoint-loaded retriever was provided.")
+        g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
+        pool_k = max(k, rerank_pool)
+        gnn_ranked = gnn_retriever.retrieve(
+            s.question, g.to_torch(device=gnn_retriever.device), k=pool_k
+        )
+        cand_ids = [i for i, _, _ in gnn_ranked]
+        cand_texts = [g.node_texts[i] for i in cand_ids]
+
+        gnn_scores = _minmax([float(score) for _, score, _ in gnn_ranked])
+        sbert_scores = [0.0 for _ in cand_ids]
+        for local_i, score, _ in SBERTRetriever(cand_texts, model_name=sbert_model).retrieve(
+            s.question, k=len(cand_ids)
+        ):
+            sbert_scores[local_i] = float(score)
+        sbert_scores = _minmax(sbert_scores)
+
+        bm25_scores = [0.0 for _ in cand_ids]
+        for local_i, score, _ in BM25Retriever(cand_texts).retrieve(s.question, k=len(cand_ids)):
+            bm25_scores[local_i] = float(score)
+        bm25_scores = _minmax(bm25_scores)
+
+        fused = []
+        for local_i, gid in enumerate(cand_ids):
+            score = (
+                fusion_gnn_weight * gnn_scores[local_i]
+                + fusion_sbert_weight * sbert_scores[local_i]
+                + fusion_bm25_weight * bm25_scores[local_i]
+            )
+            fused.append((gid, score, g.node_texts[gid]))
+        r = sorted(fused, key=lambda x: x[1], reverse=True)[:k]
     else:
         raise ValueError(f"Unsupported retriever: {retriever}")
     ids = [i for i, _, _ in r]
@@ -134,9 +180,16 @@ def _retrieve_one(
 def main() -> None:
     p = argparse.ArgumentParser(description="End-to-end retrieval + QA + judge evaluation.")
     p.add_argument("--data", default="data/raw/longmemeval/longmemeval_s.json")
-    p.add_argument("--retriever", choices=("bm25", "sbert", "ppr", "gnn", "gnn+sbert_rerank"), default="sbert")
+    p.add_argument(
+        "--retriever",
+        choices=("bm25", "sbert", "ppr", "gnn", "gnn+sbert_rerank", "gnn+fusion_rerank"),
+        default="sbert",
+    )
     p.add_argument("--checkpoint", default="", help="Required when --retriever gnn")
     p.add_argument("--rerank-pool", type=int, default=20)
+    p.add_argument("--fusion-gnn-weight", type=float, default=0.5)
+    p.add_argument("--fusion-sbert-weight", type=float, default=0.3)
+    p.add_argument("--fusion-bm25-weight", type=float, default=0.2)
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -170,7 +223,7 @@ def main() -> None:
     if args.sbert_local_only:
         sbert_model = _resolve_local_sbert_model(args.sbert_model)
     gnn_retriever: GNNRetriever | None = None
-    if args.retriever in ("gnn", "gnn+sbert_rerank"):
+    if args.retriever in ("gnn", "gnn+sbert_rerank", "gnn+fusion_rerank"):
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required when --retriever gnn")
         if args.checkpoint == "random_init":
@@ -225,6 +278,9 @@ def main() -> None:
             sbert_model,
             gnn_retriever=gnn_retriever,
             rerank_pool=args.rerank_pool,
+            fusion_gnn_weight=args.fusion_gnn_weight,
+            fusion_sbert_weight=args.fusion_sbert_weight,
+            fusion_bm25_weight=args.fusion_bm25_weight,
         )
         retrieved_ids.append(ids)
         contexts.append(ctx)

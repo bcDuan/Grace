@@ -12,6 +12,9 @@ import torch
 from grace.schema import Turn
 
 
+_SBERT_CACHE: dict[str, Any] = {}
+
+
 @dataclass
 class MemoryGraph:
     """Unified graph for retrieval + GNN + PPR."""
@@ -117,7 +120,10 @@ def build_sentence_graph(
 def _encode_sbert(texts: list[str], model_name: str) -> np.ndarray:
     from sentence_transformers import SentenceTransformer
 
-    m = SentenceTransformer(model_name)
+    m = _SBERT_CACHE.get(model_name)
+    if m is None:
+        m = SentenceTransformer(model_name)
+        _SBERT_CACHE[model_name] = m
     emb = m.encode(
         texts,
         convert_to_numpy=True,

@@ -99,6 +99,44 @@ def bce_loss(
     return pos_loss + neg_loss
 
 
+def weighted_bce_loss(
+    logits: torch.Tensor,
+    label_weights: torch.Tensor,
+    neg_ratio: int = 5,
+) -> torch.Tensor:
+    """Weighted BCE for answer-aware weak supervision.
+
+    Nodes with label_weights > 0 are positive nodes. Weight magnitude controls
+    how strongly a positive should be learned, e.g. answer-bearing turns get
+    1.0 while same-session context turns may get 0.2.
+    """
+    pos_idx = (label_weights > 0).nonzero(as_tuple=True)[0]
+    neg_pool = (label_weights <= 0).nonzero(as_tuple=True)[0]
+    if len(pos_idx) == 0 or len(neg_pool) == 0:
+        return logits.new_zeros(())
+    n_neg = min(len(pos_idx) * neg_ratio, len(neg_pool))
+    neg_idx = neg_pool[
+        torch.randperm(len(neg_pool), device=logits.device)[:n_neg]
+    ]
+
+    pos_logits = logits[pos_idx]
+    pos_targets = torch.ones_like(pos_logits)
+    pos_weights = label_weights[pos_idx].to(logits.dtype)
+    pos_loss = F.binary_cross_entropy_with_logits(
+        pos_logits,
+        pos_targets,
+        weight=pos_weights,
+        reduction="sum",
+    ) / pos_weights.sum().clamp_min(1.0)
+
+    neg_logits = logits[neg_idx]
+    neg_loss = F.binary_cross_entropy_with_logits(
+        neg_logits,
+        torch.zeros_like(neg_logits),
+    )
+    return pos_loss + neg_loss
+
+
 def infonce_loss(
     logits: torch.Tensor,
     pos_mask: torch.Tensor,
@@ -113,13 +151,58 @@ def infonce_loss(
     return -(log_num - log_denom).mean()
 
 
+def answer_pairwise_ranking_loss(
+    logits: torch.Tensor,
+    label_weights: torch.Tensor,
+    margin: float = 0.5,
+    hard_negatives: int = 16,
+) -> torch.Tensor:
+    """Rank answer-bearing turns above weaker context and hard negatives.
+
+    This loss is only active when answer-aware labels found strong positives
+    (label weight >= 1.0). It directly targets the QA failure mode where the
+    model retrieves the right session but ranks a non-answer turn above the
+    answer-bearing turn.
+    """
+    strong_idx = (label_weights >= 1.0).nonzero(as_tuple=True)[0]
+    cand_idx = (label_weights < 1.0).nonzero(as_tuple=True)[0]
+    if len(strong_idx) == 0 or len(cand_idx) == 0:
+        return logits.new_zeros(())
+
+    if hard_negatives > 0 and len(cand_idx) > hard_negatives:
+        cand_scores = logits[cand_idx].detach()
+        top_local = torch.topk(cand_scores, k=hard_negatives).indices
+        cand_idx = cand_idx[top_local]
+
+    pos_logits = logits[strong_idx].unsqueeze(1)
+    neg_logits = logits[cand_idx].unsqueeze(0)
+    return F.relu(margin - pos_logits + neg_logits).mean()
+
+
 def combined_loss(
     logits: torch.Tensor,
     pos_mask: torch.Tensor,
+    label_weights: torch.Tensor | None = None,
     lam: float = 0.5,
     neg_ratio: int = 5,
     temperature: float = 0.1,
+    rank_lam: float = 0.0,
+    rank_margin: float = 0.5,
+    hard_negatives: int = 16,
 ) -> torch.Tensor:
-    return bce_loss(logits, pos_mask, neg_ratio) + lam * infonce_loss(
-        logits, pos_mask, temperature
-    )
+    if label_weights is None:
+        bce = bce_loss(logits, pos_mask, neg_ratio)
+        contrast_mask = pos_mask
+        rank = logits.new_zeros(())
+    else:
+        bce = weighted_bce_loss(logits, label_weights, neg_ratio)
+        contrast_mask = label_weights >= 1.0
+        if not contrast_mask.any():
+            contrast_mask = pos_mask
+        rank = answer_pairwise_ranking_loss(
+            logits,
+            label_weights,
+            margin=rank_margin,
+            hard_negatives=hard_negatives,
+        )
+    return bce + lam * infonce_loss(logits, contrast_mask, temperature) + rank_lam * rank

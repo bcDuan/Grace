@@ -1,8 +1,10 @@
-"""PyTorch Dataset: one query + memory graph + positive node mask (evidence)."""
+"""PyTorch Dataset: one query + memory graph + answer-aware evidence labels."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+import string
 from typing import Any
 
 import numpy as np
@@ -34,6 +36,8 @@ class GraphRow:
     question_type: str
     graph: MemoryGraph
     pos_mask: np.ndarray  # bool (N,)
+    label_weights: np.ndarray | None = None  # float (N,), answer-aware BCE weights
+    strong_pos_mask: np.ndarray | None = None  # bool (N,), answer-bearing turns
 
 
 class GraphMatchDataset(Dataset):
@@ -77,9 +81,36 @@ class GraphMatchDataset(Dataset):
         if x is None:
             raise ValueError("Graph has no x; use build_sentence_graph (SBERT) first")
         pos = torch.tensor(r.pos_mask, dtype=torch.bool)
+        if r.label_weights is None:
+            label_weights = pos.float()
+        else:
+            label_weights = torch.tensor(r.label_weights, dtype=torch.float32)
+        if r.strong_pos_mask is None:
+            strong_pos = torch.zeros_like(pos)
+        else:
+            strong_pos = torch.tensor(r.strong_pos_mask, dtype=torch.bool)
         qe = self._query_emb(idx)
         q = torch.tensor(qe, dtype=torch.float32)
-        return x, ei, q, pos, g.node_texts
+        return x, ei, q, pos, label_weights, strong_pos, g.node_texts
+
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _normalize_for_match(text: str) -> str:
+    text = text.lower()
+    text = text.translate(_PUNCT_TABLE)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _answer_in_text(answer: str | None, text: str, *, max_answer_chars: int = 120) -> bool:
+    if not answer:
+        return False
+    ans = _normalize_for_match(str(answer))
+    if not ans or len(ans) > max_answer_chars:
+        return False
+    return ans in _normalize_for_match(text)
 
 
 def longmem_samples_to_graph_rows(
@@ -87,6 +118,7 @@ def longmem_samples_to_graph_rows(
     *,
     topk: int = 5,
     sbert: str = "sentence-transformers/all-MiniLM-L6-v2",
+    weak_positive_weight: float = 0.2,
 ) -> list[GraphRow]:
     out: list[GraphRow] = []
     for s in samples:
@@ -103,12 +135,24 @@ def longmem_samples_to_graph_rows(
         if not mask.any():
             # skip or keep as no supervision — skip for training
             continue
+        strong = np.zeros(n, dtype=bool)
+        for gid in s.evidence_global_ids:
+            if 0 <= gid < n and _answer_in_text(s.answer, g.node_texts[gid]):
+                strong[gid] = True
+        weights = np.zeros(n, dtype=np.float32)
+        if strong.any():
+            weights[mask] = float(weak_positive_weight)
+            weights[strong] = 1.0
+        else:
+            weights[mask] = 1.0
         out.append(
             GraphRow(
                 question=s.question,
                 question_type=s.question_type,
                 graph=g,
                 pos_mask=mask,
+                label_weights=weights,
+                strong_pos_mask=strong,
             )
         )
     return out

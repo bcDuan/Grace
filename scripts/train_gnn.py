@@ -34,18 +34,50 @@ def collate(batch):
     return batch
 
 
-def train_one_epoch(model, loader, opt, device, lam: float, neg_ratio: int) -> float:
+def unpack_graph_item(item: tuple):
+    """Support both legacy 5-tuples and answer-aware 7-tuples."""
+    if len(item) == 5:
+        x, edge_index, q, pos_mask, node_texts = item
+        label_weights = pos_mask.float()
+        strong_pos_mask = torch.zeros_like(pos_mask, dtype=torch.bool)
+        return x, edge_index, q, pos_mask, label_weights, strong_pos_mask, node_texts
+    return item
+
+
+def train_one_epoch(
+    model,
+    loader,
+    opt,
+    device,
+    lam: float,
+    neg_ratio: int,
+    rank_lam: float,
+    rank_margin: float,
+    hard_negatives: int,
+) -> float:
     model.train()
     total, n = 0.0, 0
     for batch in loader:
         opt.zero_grad()
         loss = 0.0
         m = 0
-        for x, edge_index, q, pos_mask, _ in batch:
+        for item in batch:
+            x, edge_index, q, pos_mask, label_weights, _, _ = unpack_graph_item(item)
             x, edge_index = x.to(device), edge_index.to(device)
-            q, pos_mask = q.to(device), pos_mask.to(device)
+            q = q.to(device)
+            pos_mask = pos_mask.to(device)
+            label_weights = label_weights.to(device)
             logits = model(x, edge_index, q)
-            loss = loss + combined_loss(logits, pos_mask, lam=lam, neg_ratio=neg_ratio)
+            loss = loss + combined_loss(
+                logits,
+                pos_mask,
+                label_weights=label_weights,
+                lam=lam,
+                neg_ratio=neg_ratio,
+                rank_lam=rank_lam,
+                rank_margin=rank_margin,
+                hard_negatives=hard_negatives,
+            )
             m += 1
         if m == 0:
             continue
@@ -63,7 +95,8 @@ def eval_recall(model, loader, device, k: int = 5) -> float:
     model.eval()
     hits, tot = 0, 0
     for batch in loader:
-        for x, edge_index, q, pos_mask, _ in batch:
+        for item in batch:
+            x, edge_index, q, pos_mask, _, _, _ = unpack_graph_item(item)
             x, edge_index = x.to(device), edge_index.to(device)
             q, pos_mask = q.to(device), pos_mask.to(device)
             logits = model(x, edge_index, q)
@@ -71,6 +104,26 @@ def eval_recall(model, loader, device, k: int = 5) -> float:
             topk = torch.topk(logits, k=kk).indices
             hit = pos_mask[topk].any().item()
             hits += int(hit)
+            tot += 1
+    return hits / max(tot, 1)
+
+
+@torch.no_grad()
+def eval_strong_hit(model, loader, device, k: int = 5) -> float:
+    model.eval()
+    hits, tot = 0, 0
+    for batch in loader:
+        for item in batch:
+            x, edge_index, q, _, _, strong_pos_mask, _ = unpack_graph_item(item)
+            if not strong_pos_mask.any():
+                continue
+            x, edge_index = x.to(device), edge_index.to(device)
+            q = q.to(device)
+            strong_pos_mask = strong_pos_mask.to(device)
+            logits = model(x, edge_index, q)
+            kk = min(k, int(logits.size(0)))
+            topk = torch.topk(logits, k=kk).indices
+            hits += int(strong_pos_mask[topk].any().item())
             tot += 1
     return hits / max(tot, 1)
 
@@ -207,11 +260,47 @@ def main() -> None:
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lam", type=float, default=0.5)
     p.add_argument("--neg_ratio", type=int, default=4, help="Negative sampling ratio for BCE.")
+    p.add_argument(
+        "--rank_lam",
+        type=float,
+        default=0.0,
+        help="Weight for answer-aware pairwise ranking loss.",
+    )
+    p.add_argument(
+        "--rank_margin",
+        type=float,
+        default=0.5,
+        help="Margin for answer-aware pairwise ranking loss.",
+    )
+    p.add_argument(
+        "--hard_negatives",
+        type=int,
+        default=16,
+        help="Number of high-scoring non-answer candidates used by pairwise ranking.",
+    )
+    p.add_argument(
+        "--weak_positive_weight",
+        type=float,
+        default=0.2,
+        help="BCE weight for non-answer turns inside a gold evidence session.",
+    )
     p.add_argument("--out", default="experiments/checkpoints/gnn.pt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--topk_graph", type=int, default=5)
     p.add_argument("--sbert", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--val_limit", type=int, default=30)
+    p.add_argument(
+        "--val_graph_limit",
+        type=int,
+        default=0,
+        help="Optional cap on validation graphs for retrieval-only smoke runs; 0 means full val split.",
+    )
+    p.add_argument(
+        "--train_limit",
+        type=int,
+        default=0,
+        help="Optional cap on training samples for smoke runs; 0 means full train split.",
+    )
     p.add_argument("--val_seed", type=int, default=42)
     p.add_argument(
         "--checkpoint_pattern",
@@ -223,6 +312,11 @@ def main() -> None:
     p.add_argument("--reader_batch_size", type=int, default=2)
     p.add_argument("--judge_backend", choices=("siliconflow", "deepseek", "local_vllm"), default="siliconflow")
     p.add_argument("--judge_cache_dir", default="data/processed/judge_cache")
+    p.add_argument(
+        "--skip_qa_eval",
+        action="store_true",
+        help="Skip reader/judge validation and report retrieval-only training logs.",
+    )
     p.add_argument("--resume_checkpoint", default="", help="Optional: resume model weights from this checkpoint")
     p.add_argument(
         "--curve_out",
@@ -237,13 +331,41 @@ def main() -> None:
     tr_idx, va_idx = split_indices(n, 0.8, args.seed)
     train_s = [all_samples[i] for i in tr_idx]
     val_s = [all_samples[i] for i in va_idx]
+    if args.train_limit and args.train_limit > 0:
+        train_s = stratified_sample(train_s, args.train_limit, seed=args.seed)
+    val_s_for_rows = val_s
+    if args.val_graph_limit and args.val_graph_limit > 0:
+        val_s_for_rows = stratified_sample(val_s, args.val_graph_limit, seed=args.val_seed)
     train_rows = longmem_samples_to_graph_rows(
-        train_s, topk=args.topk_graph, sbert=args.sbert
+        train_s,
+        topk=args.topk_graph,
+        sbert=args.sbert,
+        weak_positive_weight=args.weak_positive_weight,
     )
-    val_rows = longmem_samples_to_graph_rows(val_s, topk=args.topk_graph, sbert=args.sbert)
+    val_rows = longmem_samples_to_graph_rows(
+        val_s_for_rows,
+        topk=args.topk_graph,
+        sbert=args.sbert,
+        weak_positive_weight=args.weak_positive_weight,
+    )
     if not train_rows:
         print("No training rows (missing evidence or empty turns).")
         return
+    train_strong = sum(
+        1 for r in train_rows if r.strong_pos_mask is not None and r.strong_pos_mask.any()
+    )
+    val_strong = sum(
+        1 for r in val_rows if r.strong_pos_mask is not None and r.strong_pos_mask.any()
+    )
+    print(
+        f"[label] train_rows={len(train_rows)} strong_rows={train_strong} "
+        f"strong_rate={train_strong / max(len(train_rows), 1):.3f} "
+        f"weak_positive_weight={args.weak_positive_weight}"
+    )
+    print(
+        f"[label] val_rows={len(val_rows)} strong_rows={val_strong} "
+        f"strong_rate={val_strong / max(len(val_rows), 1):.3f}"
+    )
     train_ds = GraphMatchDataset(train_rows, sbert=None)
     val_ds = GraphMatchDataset(val_rows, sbert=None)
     train_loader = DataLoader(
@@ -276,8 +398,11 @@ def main() -> None:
                 "turn_meta": _build_turn_meta(s),
             }
         )
-    reader = QwenReader(model_name=args.reader_model, backend=args.reader_backend)
-    judge = LLMJudge(backend=args.judge_backend, cache_dir=args.judge_cache_dir)
+    reader = None
+    judge = None
+    if not args.skip_qa_eval:
+        reader = QwenReader(model_name=args.reader_model, backend=args.reader_backend)
+        judge = LLMJudge(backend=args.judge_backend, cache_dir=args.judge_cache_dir)
     best_metric = -1.0
     best_epoch = -1
     out = Path(args.out)
@@ -289,20 +414,37 @@ def main() -> None:
     max_epochs = args.epochs
     epoch = 1
     while epoch <= max_epochs:
-        loss = train_one_epoch(model, train_loader, opt, device, lam=args.lam, neg_ratio=args.neg_ratio)
-        r5 = eval_recall(model, val_loader, device, k=5)
-        val_acc, val_sess_r5 = eval_qa_accuracy(
-            model=model,
-            val_graphs=val_graphs,
-            sbert=sbert,
-            reader=reader,
-            judge=judge,
-            device=device,
-            k=5,
-            reader_batch_size=args.reader_batch_size,
+        loss = train_one_epoch(
+            model,
+            train_loader,
+            opt,
+            device,
+            lam=args.lam,
+            neg_ratio=args.neg_ratio,
+            rank_lam=args.rank_lam,
+            rank_margin=args.rank_margin,
+            hard_negatives=args.hard_negatives,
         )
-        metric = val_acc
-        if metric > best_metric:
+        r5 = eval_recall(model, val_loader, device, k=5)
+        strong_h5 = eval_strong_hit(model, val_loader, device, k=5)
+        if args.skip_qa_eval:
+            val_acc, val_sess_r5 = float("nan"), float("nan")
+        else:
+            assert reader is not None and judge is not None
+            val_acc, val_sess_r5 = eval_qa_accuracy(
+                model=model,
+                val_graphs=val_graphs,
+                sbert=sbert,
+                reader=reader,
+                judge=judge,
+                device=device,
+                k=5,
+                reader_batch_size=args.reader_batch_size,
+            )
+        metric = r5 if args.skip_qa_eval else val_acc
+        if np.isnan(metric):
+            tag = ""
+        elif metric > best_metric:
             best_metric = metric
             best_epoch = epoch
             tag = "  (best so far)"
@@ -313,13 +455,14 @@ def main() -> None:
         torch.save(model.state_dict(), ep_path)
         print(
             f"[ep {epoch}/{max_epochs}] train_loss={loss:.3f}  val_R@5={r5:.3f}  "
-            f"val_acc={val_acc:.3f}{tag}"
+            f"val_StrongHit@5={strong_h5:.3f}  val_acc={val_acc:.3f}{tag}"
         )
         hist.append(
             {
                 "epoch": epoch,
                 "train_loss": float(loss),
                 "val_R5": float(r5),
+                "val_StrongHit5": float(strong_h5),
                 "val_acc": float(val_acc),
                 "qa_eval": True,
             }
@@ -339,6 +482,7 @@ def main() -> None:
                     "epoch": r["epoch"],
                     "train_loss": r["train_loss"],
                     "val_R5": r["val_R5"],
+                    "val_StrongHit5": r["val_StrongHit5"],
                     "val_acc": r["val_acc"],
                 }
                 for r in hist
@@ -350,17 +494,23 @@ def main() -> None:
     )
     print(f"[OK] saved training curve: {curve_path}")
     print(f"training_wall_clock_sec={time.time() - t_train0:.2f}")
-    js = judge.stats()
-    print(
-        f"judge_calls={js['total_judge_calls']} judge_cache_hit_rate={js['judge_cache_hit_rate']:.3f} "
-        f"judge_est_cost_cny={js['est_cost_cny']}"
-    )
+    if judge is not None:
+        js = judge.stats()
+        print(
+            f"judge_calls={js['total_judge_calls']} judge_cache_hit_rate={js['judge_cache_hit_rate']:.3f} "
+            f"judge_est_cost_cny={js['est_cost_cny']}"
+        )
     print("\n=== TRAINING CURVE (all epochs) ===")
-    print("epoch\tloss\tval_R@5\tval_acc")
+    print("epoch\tloss\tval_R@5\tval_StrongHit@5\tval_acc")
     for row in hist:
         val_acc_txt = "nan" if row["val_acc"] is None else f"{row['val_acc']:.3f}"
-        print(f"{row['epoch']}\t{row['train_loss']:.3f}\t{row['val_R5']:.3f}\t{val_acc_txt}")
+        print(
+            f"{row['epoch']}\t{row['train_loss']:.3f}\t{row['val_R5']:.3f}\t"
+            f"{row['val_StrongHit5']:.3f}\t{val_acc_txt}"
+        )
     best_acc = max((float(r["val_acc"]) for r in hist if r["val_acc"] is not None), default=float("nan"))
+    if args.skip_qa_eval:
+        return
     if np.isnan(best_acc) or best_acc < 0.45:
         print("[diag] GNN val_acc < 0.45")
         for row in hist:
