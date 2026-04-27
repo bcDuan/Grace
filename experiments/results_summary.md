@@ -4,6 +4,30 @@ Date: 2026-04-26
 
 This file is a lightweight, git-tracked summary of the main experiment results. Full JSON outputs and model checkpoints are intentionally not committed because `experiments/results/**` and `*.pt` are ignored.
 
+## Submission Update: 2026-04-27
+
+This is the code version intended for course project submission.
+
+Current main method:
+
+```text
+Pairwise GraphSAGE + Graph-Guided Fusion Rerank + Qwen2.5-14B Reader, k=10
+```
+
+Current main n100 result:
+
+| Method | QA Acc | SessR@10 | Recall@10 | Hit@10 | MRR | IDK |
+|---|---:|---:|---:|---:|---:|---:|
+| Pairwise GraphSAGE + Fusion + Qwen2.5-14B, k=10 | **0.550** | **0.949** | **0.546** | **0.970** | **0.950** | **0.160** |
+
+Main result file on the remote server:
+
+```text
+experiments/results/pairwise_ft_ep8_fusion_qwen14b_k10_n100.json
+```
+
+The legacy JSON metric keys still include `*_at_5`, but when `config.k=10` the metric values are computed at k=10.
+
 ## Main Result
 
 Evaluation setting: LongMemEval-S, stratified n=100, top-k=5, Qwen2.5-7B reader, LLM judge.

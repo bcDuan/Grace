@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Any, Sequence
 
 import networkx as nx
@@ -62,8 +63,10 @@ def build_sentence_graph(
     topk: int = 5,
     sbert_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     embed_dim: int | None = None,
+    session_window: int = 1,
+    session_semantic_topk: int = 0,
 ) -> MemoryGraph:
-    """Sentence nodes: SBERT sim top-k (undirected) + same-session chain edges."""
+    """Sentence nodes with semantic edges and optional same-session local structure."""
     if not turns:
         return MemoryGraph(node_texts=[], edge_index=np.zeros((2, 0), dtype=np.int64), x=None)
     texts: list[str] = []
@@ -92,9 +95,31 @@ def build_sentence_graph(
             if j < 0 or j == i:
                 continue
             _dedup_edges(int(i), int(j), seen, edges)
-    for i in range(n - 1):
-        if sess[i] == sess[i + 1]:
-            _dedup_edges(i, i + 1, seen, edges)
+
+    same_sess_k = max(0, int(session_semantic_topk))
+    if same_sess_k > 0:
+        by_session: dict[int, list[int]] = defaultdict(list)
+        for idx, sid in enumerate(sess):
+            by_session[sid].append(idx)
+        for members in by_session.values():
+            if len(members) <= 1:
+                continue
+            member_arr = np.asarray(members, dtype=np.int64)
+            sub_sim = sim[np.ix_(member_arr, member_arr)].copy()
+            np.fill_diagonal(sub_sim, -np.inf)
+            local_k = min(same_sess_k, len(members) - 1)
+            for local_i, gid_i in enumerate(members):
+                local_top = np.argsort(-sub_sim[local_i])[:local_k]
+                for local_j in local_top:
+                    _dedup_edges(gid_i, members[int(local_j)], seen, edges)
+
+    window = max(0, int(session_window))
+    if window > 0:
+        for i in range(n):
+            hi = min(n, i + window + 1)
+            for j in range(i + 1, hi):
+                if sess[i] == sess[j]:
+                    _dedup_edges(i, j, seen, edges)
     if not edges and n > 1:
         for i in range(n - 1):
             _dedup_edges(i, i + 1, seen, edges)
@@ -113,7 +138,13 @@ def build_sentence_graph(
         edge_index=eix,
         x=np.asarray(st, dtype=np.float32),
         nx_graph=g,
-        meta={"kind": "sentence", "sbert": sbert_model, "topk": topk},
+        meta={
+            "kind": "sentence",
+            "sbert": sbert_model,
+            "topk": topk,
+            "session_window": session_window,
+            "session_semantic_topk": session_semantic_topk,
+        },
     )
 
 

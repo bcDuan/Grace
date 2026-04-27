@@ -1,11 +1,11 @@
-"""Query-conditioned GraphSAGE retriever for GRACE."""
+"""Query-conditioned GNN retrievers for GRACE."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import GATConv, MessagePassing
 from torch_geometric.utils import add_self_loops
 
 
@@ -33,8 +33,39 @@ class QueryConditionedSAGEConv(MessagePassing):
         return x_j
 
 
+class QueryConditionedGATConv(nn.Module):
+    """One GAT layer whose node attention is conditioned on the query vector."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        query_dim: int,
+        heads: int = 4,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.conv = GATConv(
+            in_dim + query_dim,
+            out_dim,
+            heads=heads,
+            concat=False,
+            dropout=dropout,
+            add_self_loops=True,
+        )
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        q_expand = q.unsqueeze(0).expand(x.size(0), -1)
+        h = torch.cat([x, q_expand], dim=-1)
+        h = self.conv(h, edge_index)
+        h = F.relu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        return h
+
+
 class QueryGNN(nn.Module):
-    """Stacked query-conditioned GraphSAGE + MLP scoring head."""
+    """Stacked query-conditioned GNN + MLP scoring head."""
 
     def __init__(
         self,
@@ -43,20 +74,55 @@ class QueryGNN(nn.Module):
         num_layers: int = 2,
         query_dim: int = 384,
         dropout: float = 0.2,
+        arch: str = "sage",
+        gat_heads: int = 4,
     ):
         super().__init__()
+        if arch not in {"sage", "sage_res", "sage_skip", "sage_qa", "gat"}:
+            raise ValueError(f"Unsupported QueryGNN arch: {arch}")
+        self.arch = arch
+        self.in_dim = in_dim
         self.layers = nn.ModuleList()
-        self.layers.append(
-            QueryConditionedSAGEConv(in_dim, hidden_dim, query_dim, dropout)
+        self.residual_norms = nn.ModuleList()
+        self.residual_projs = nn.ModuleList()
+        layer_cls = (
+            QueryConditionedSAGEConv
+            if arch in {"sage", "sage_res", "sage_skip", "sage_qa"}
+            else QueryConditionedGATConv
         )
-        for _ in range(num_layers - 1):
+        if arch in {"sage", "sage_res", "sage_skip", "sage_qa"}:
+            self.layers.append(layer_cls(in_dim, hidden_dim, query_dim, dropout))
+            for _ in range(num_layers - 1):
+                self.layers.append(layer_cls(hidden_dim, hidden_dim, query_dim, dropout))
+            if arch == "sage_res":
+                layer_input_dims = [in_dim] + [hidden_dim] * (num_layers - 1)
+                for layer_in_dim in layer_input_dims:
+                    self.residual_norms.append(nn.LayerNorm(hidden_dim))
+                    if layer_in_dim == hidden_dim:
+                        self.residual_projs.append(nn.Identity())
+                    else:
+                        self.residual_projs.append(nn.Linear(layer_in_dim, hidden_dim))
+        else:
             self.layers.append(
-                QueryConditionedSAGEConv(
-                    hidden_dim, hidden_dim, query_dim, dropout
-                )
+                layer_cls(in_dim, hidden_dim, query_dim, heads=gat_heads, dropout=dropout)
             )
+            for _ in range(num_layers - 1):
+                self.layers.append(
+                    layer_cls(
+                        hidden_dim,
+                        hidden_dim,
+                        query_dim,
+                        heads=gat_heads,
+                        dropout=dropout,
+                    )
+                )
+        score_dim = hidden_dim + query_dim
+        if arch == "sage_skip":
+            score_dim += in_dim
+        elif arch == "sage_qa":
+            score_dim += in_dim * 3
         self.score_head = nn.Sequential(
-            nn.Linear(hidden_dim + query_dim, 128),
+            nn.Linear(score_dim, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(128, 1),
@@ -64,14 +130,26 @@ class QueryGNN(nn.Module):
 
     def encode(self, x: torch.Tensor, edge_index: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
         h = x
-        for layer in self.layers:
-            h = layer(h, edge_index, q)
+        for i, layer in enumerate(self.layers):
+            h_next = layer(h, edge_index, q)
+            if self.arch == "sage_res":
+                h_next = self.residual_norms[i](h_next + self.residual_projs[i](h))
+            h = h_next
         return h
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
         h = self.encode(x, edge_index, q)
         q_expand = q.unsqueeze(0).expand(h.size(0), -1)
-        logits = self.score_head(torch.cat([h, q_expand], dim=-1)).squeeze(-1)
+        if self.arch == "sage_skip":
+            score_features = torch.cat([h, x, q_expand], dim=-1)
+        elif self.arch == "sage_qa":
+            score_features = torch.cat(
+                [h, q_expand, x, torch.abs(x - q_expand), x * q_expand],
+                dim=-1,
+            )
+        else:
+            score_features = torch.cat([h, q_expand], dim=-1)
+        logits = self.score_head(score_features).squeeze(-1)
         return logits
 
 

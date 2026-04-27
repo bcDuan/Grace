@@ -37,7 +37,7 @@ class LLMJudge:
         self.cache_hits = 0
 
     def _cache_key(self, question: str, gold: str, predicted: str, question_type: str) -> str:
-        key = f"{question}|{gold}|{predicted}|{question_type}|{self.model}"
+        key = f"v2|{question}|{gold}|{predicted}|{question_type}|{self.model}"
         return hashlib.md5(key.encode("utf-8")).hexdigest()
 
     def _build_prompt(self, question: str, gold: str, predicted: str, qtype: str) -> str:
@@ -76,8 +76,14 @@ class LLMJudge:
             except Exception:
                 pass
         low = text.lower()
+        if re.search(r"\b(false|incorrect)\b", low) or "not correct" in low:
+            correct = False
+        elif re.search(r"\b(true|correct)\b", low):
+            correct = True
+        else:
+            correct = False
         return {
-            "correct": ("true" in low or "correct" in low),
+            "correct": correct,
             "reasoning": text[:300],
         }
 
@@ -107,7 +113,9 @@ class LLMJudge:
                         getattr(usage, "total_tokens", 0)
                         or (getattr(usage, "prompt_tokens", 0) + getattr(usage, "completion_tokens", 0))
                     )
-                result = self._parse_response(resp.choices[0].message.content or "")
+                raw_response = resp.choices[0].message.content or ""
+                result = self._parse_response(raw_response)
+                result["raw_response"] = raw_response
                 cache_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
                 return {**result, "cached": False}
             except Exception as e:

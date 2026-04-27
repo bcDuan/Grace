@@ -18,6 +18,8 @@ class GNNRetriever:
         device: str | None = None,
         num_layers: int = 2,
         hidden_dim: int = 256,
+        arch: str = "sage",
+        gat_heads: int = 4,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sbert = SentenceTransformer(sbert_name, device=self.device)
@@ -26,6 +28,8 @@ class GNNRetriever:
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             query_dim=384,
+            arch=arch,
+            gat_heads=gat_heads,
         ).to(self.device)
         state = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state)

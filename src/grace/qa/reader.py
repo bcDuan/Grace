@@ -17,11 +17,15 @@ class QwenReader:
         max_new_tokens: int = 64,
         temperature: float = 0.0,
         cache_dir: str = "data/processed/reader_cache",
+        prompt_mode: str = "plain",
     ):
+        if prompt_mode not in {"plain", "ranked", "retrieval_aware"}:
+            raise ValueError(f"Unknown reader prompt_mode: {prompt_mode}")
         self.model_name = model_name
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._backend = backend
+        self.prompt_mode = prompt_mode
         self.max_new_tokens = min(max_new_tokens, 64)
         self.temperature = temperature
         self.stop_strings = ["\n\n", "Question:", "Past conversation"]
@@ -59,13 +63,54 @@ class QwenReader:
 
     def _cache_key(self, question: str, context: list[dict[str, Any]]) -> str:
         text = json.dumps(
-            {"q": question, "ctx": context, "m": self.model_name, "b": self._backend},
+            {
+                "q": question,
+                "ctx": context,
+                "m": self.model_name,
+                "b": self._backend,
+                "prompt_mode": self.prompt_mode,
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
+    def _retrieval_header(self, turn: dict[str, Any]) -> str:
+        fields = []
+        if "evidence_rank" in turn:
+            fields.append(f"rank={turn['evidence_rank']}")
+        if self.prompt_mode == "ranked":
+            sid = str(turn.get("session_id", "unknown"))
+            sdate = str(turn.get("session_date", "") or "")
+            fields = []
+            if "evidence_rank" in turn:
+                fields.append(f"rank={turn['evidence_rank']}")
+            fields.append(f"session={sdate or sid}")
+            fields.append(f"role={str(turn.get('role', 'unknown')).lower()}")
+            return "[Evidence " + " | ".join(fields) + "]"
+        if "retrieval_score" in turn:
+            fields.append(f"score={float(turn['retrieval_score']):.3f}")
+        if "gnn_score" in turn:
+            fields.append(f"gnn={float(turn['gnn_score']):.3f}")
+        if "sbert_score" in turn:
+            fields.append(f"sbert={float(turn['sbert_score']):.3f}")
+        if "bm25_score" in turn:
+            fields.append(f"bm25={float(turn['bm25_score']):.3f}")
+        sid = str(turn.get("session_id", "unknown"))
+        sdate = str(turn.get("session_date", "") or "")
+        fields.append(f"session={sdate or sid}")
+        fields.append(f"role={str(turn.get('role', 'unknown')).lower()}")
+        return "[Evidence " + " | ".join(fields) + "]"
+
     def _format_context(self, retrieved_turns: list[dict[str, Any]]) -> str:
+        if self.prompt_mode in {"ranked", "retrieval_aware"}:
+            blocks = []
+            for t in retrieved_turns:
+                role = str(t.get("role", "unknown")).upper()
+                content = str(t.get("content", ""))
+                blocks.append(f"{self._retrieval_header(t)}\n{role}: {content}")
+            return "\n\n".join(blocks)
+
         by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for t in retrieved_turns:
             by_session[str(t.get("session_id", "unknown"))].append(t)
@@ -96,6 +141,21 @@ class QwenReader:
                     "on the excerpts. Be concise: output the shortest answer that fully "
                     "answers the question. If the answer is not present in the excerpts, "
                     "output exactly: I don't know."
+                    + (
+                        " The excerpts are ordered by retrieval relevance. Prefer earlier "
+                        "evidence when multiple excerpts conflict, but only answer when "
+                        "the text itself supports the answer."
+                        if self.prompt_mode == "ranked"
+                        else ""
+                    )
+                    + (
+                        " Each excerpt may include retrieval metadata such as rank, GNN, "
+                        "SBERT, and BM25 scores. Treat these scores as hints: prefer "
+                        "higher-ranked evidence when excerpts conflict, but only answer "
+                        "when the text itself supports the answer."
+                        if self.prompt_mode == "retrieval_aware"
+                        else ""
+                    )
                 ),
             },
             {

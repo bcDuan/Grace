@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import random
+import re
+import string
 import time
 import torch
 from collections import defaultdict
@@ -61,6 +63,38 @@ def _turn_content(turn: dict) -> str:
         if v is not None and str(v).strip():
             return str(v).strip()
     return str(turn)
+
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _normalize_text(text: str | None) -> str:
+    text = str(text or "").lower()
+    text = text.translate(_PUNCT_TABLE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _answer_in_context(answer: str | None, ctx: list[dict], max_answer_chars: int = 120) -> bool:
+    ans = _normalize_text(answer)
+    if not ans or len(ans) > max_answer_chars:
+        return False
+    ctx_text = _normalize_text(" ".join(str(t.get("content", "")) for t in ctx))
+    return ans in ctx_text
+
+
+def _lexical_answer_match(gold: str | None, pred: str | None, max_gold_words: int = 8) -> bool:
+    g = _normalize_text(gold)
+    p = _normalize_text(pred)
+    if not g or not p:
+        return False
+    if len(g.split()) > max_gold_words:
+        return False
+    return g in p or p in g
+
+
+def _is_idk(pred: str | None) -> bool:
+    p = _normalize_text(pred)
+    return p in {"i dont know", "i do not know", "dont know", "unknown"}
 
 
 def _build_turn_meta(sample: LongMemSample) -> dict[int, dict]:
@@ -125,36 +159,383 @@ def _select_diverse_by_session(
     return selected
 
 
+_PACK_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+}
+
+_NUMBER_WORDS = {
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "hundred",
+    "thousand",
+}
+_MONTH_WORDS = {
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "today",
+    "tomorrow",
+    "yesterday",
+    "week",
+    "month",
+    "year",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
+_COLOR_WORDS = {
+    "black",
+    "blue",
+    "brown",
+    "green",
+    "grey",
+    "gray",
+    "orange",
+    "pink",
+    "purple",
+    "red",
+    "white",
+    "yellow",
+}
+_LOCATION_HINTS = {
+    "airport",
+    "apartment",
+    "bar",
+    "beach",
+    "cafe",
+    "campus",
+    "city",
+    "clinic",
+    "college",
+    "garden",
+    "gym",
+    "hotel",
+    "house",
+    "library",
+    "museum",
+    "office",
+    "park",
+    "restaurant",
+    "room",
+    "school",
+    "shop",
+    "store",
+    "street",
+    "studio",
+    "theater",
+    "university",
+}
+
+
+def _pack_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", str(text).lower())
+    return {w for w in words if len(w) > 2 and w not in _PACK_STOPWORDS}
+
+
+def _lexical_overlap_score(question: str, text: str) -> float:
+    q_tokens = _pack_tokens(question)
+    if not q_tokens:
+        return 0.0
+    t_tokens = _pack_tokens(text)
+    return len(q_tokens & t_tokens) / len(q_tokens)
+
+
+def _has_number(text: str) -> bool:
+    low = str(text).lower()
+    return bool(re.search(r"\d", low)) or any(w in low.split() for w in _NUMBER_WORDS)
+
+
+def _has_time(text: str) -> bool:
+    low = str(text).lower()
+    return bool(re.search(r"\b\d{1,2}[:/.-]\d{1,2}\b|\b\d{4}\b", low)) or any(w in low for w in _MONTH_WORDS)
+
+
+def _has_entity_like(text: str) -> bool:
+    return bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", str(text))) or '"' in str(text) or "'" in str(text)
+
+
+def _answer_like_bonus(question: str, text: str) -> float:
+    q = str(question).lower()
+    t = str(text).lower()
+    bonus = 0.0
+    if any(x in q for x in ("how many", "how much", "number", "amount", "price", "cost", "total", "times")):
+        bonus += 0.35 if _has_number(text) else -0.10
+    if any(x in q for x in ("when", "what time", "what date", "how long", "day", "week", "month", "year")):
+        bonus += 0.30 if _has_time(text) else -0.05
+    if "where" in q or "which place" in q:
+        bonus += 0.25 if (_has_entity_like(text) or any(w in t for w in _LOCATION_HINTS)) else -0.05
+    if "color" in q or "colour" in q:
+        bonus += 0.30 if any(w in t for w in _COLOR_WORDS) else -0.05
+    if any(x in q for x in ("who", "which", "what is the name", "name of")):
+        bonus += 0.15 if _has_entity_like(text) else 0.0
+    return bonus
+
+
+def _select_answer_aware_context(
+    question: str,
+    rows: list[tuple[int, float, str]],
+    turn_to_session: dict[int, str],
+    k: int,
+    pack_weight: float,
+    session_penalty: float,
+) -> list[tuple[int, float, str]]:
+    """Greedy final context packing tuned for answer-containing turns."""
+    selected: list[tuple[int, float, str]] = []
+    selected_counts: dict[str, int] = {}
+    remaining = list(rows)
+    while remaining and len(selected) < k:
+        best_pos = 0
+        best_score = float("-inf")
+        for pos, (gid, score, text) in enumerate(remaining):
+            sid = str(turn_to_session.get(gid, "unknown"))
+            answer_score = 0.45 * _lexical_overlap_score(question, text) + _answer_like_bonus(question, text)
+            adjusted = float(score) + pack_weight * answer_score - session_penalty * selected_counts.get(sid, 0)
+            if adjusted > best_score:
+                best_score = adjusted
+                best_pos = pos
+        chosen = remaining.pop(best_pos)
+        selected.append(chosen)
+        sid = str(turn_to_session.get(chosen[0], "unknown"))
+        selected_counts[sid] = selected_counts.get(sid, 0) + 1
+    return selected
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", str(text))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _compress_contexts_for_reader(
+    question: str,
+    ctx: list[dict],
+    sentences_per_turn: int,
+    max_chars: int,
+) -> list[dict]:
+    """Keep query-relevant sentences from retrieved turns to reduce reader noise."""
+    compressed: list[dict] = []
+    for turn in ctx:
+        content = str(turn.get("content", ""))
+        sentences = _split_sentences(content)
+        if len(content) <= 360 or len(sentences) <= sentences_per_turn:
+            new_content = content
+        else:
+            scored = []
+            for idx, sent in enumerate(sentences):
+                score = _lexical_overlap_score(question, sent) + _answer_like_bonus(question, sent)
+                scored.append((idx, score, sent))
+            picked = sorted(scored, key=lambda x: x[1], reverse=True)[:sentences_per_turn]
+            picked = sorted(picked, key=lambda x: x[0])
+            new_content = " ".join(sent for _, _, sent in picked)
+        row = dict(turn)
+        row["content"] = new_content.strip()
+        compressed.append(row)
+
+    if max_chars <= 0:
+        return compressed
+    total = 0
+    trimmed: list[dict] = []
+    for turn in compressed:
+        row = dict(turn)
+        content = str(row.get("content", ""))
+        budget = max_chars - total
+        if budget <= 0:
+            break
+        if len(content) > budget:
+            content = content[: max(0, budget)].rsplit(" ", 1)[0].strip()
+        if content:
+            row["content"] = content
+            trimmed.append(row)
+            total += len(content)
+    return trimmed
+
+
+def _expand_contexts_session_window(
+    sample: LongMemSample,
+    anchor_ids: list[int],
+    window_radius: int,
+    max_turns: int,
+    max_chars: int,
+) -> list[dict]:
+    """Expand retrieved anchor turns into local same-session windows."""
+    tm = _build_turn_meta(sample)
+    candidates: dict[int, tuple[int, int, int]] = {}
+    n_turns = len(sample.turns)
+    for anchor_rank, anchor_gid in enumerate(anchor_ids, start=1):
+        anchor_sid = sample.turn_to_session.get(anchor_gid)
+        if anchor_sid is None:
+            continue
+        lo = max(0, anchor_gid - window_radius)
+        hi = min(n_turns - 1, anchor_gid + window_radius)
+        for gid in range(lo, hi + 1):
+            if sample.turn_to_session.get(gid) != anchor_sid:
+                continue
+            dist = abs(gid - anchor_gid)
+            old = candidates.get(gid)
+            # Prefer all original anchors first, then add nearby context.
+            key = (dist, anchor_rank, anchor_gid)
+            if old is None or key < old:
+                candidates[gid] = key
+
+    chosen = sorted(candidates.items(), key=lambda x: x[1])
+    if max_turns > 0:
+        chosen = chosen[:max_turns]
+    chosen_ids = sorted(gid for gid, _ in chosen)
+    candidate_meta = {gid: meta for gid, meta in candidates.items()}
+
+    out: list[dict] = []
+    total_chars = 0
+    for gid in chosen_ids:
+        dist, anchor_rank, anchor_gid = candidate_meta[gid]
+        row = dict(
+            tm.get(
+                gid,
+                {
+                    "session_id": str(sample.turn_to_session.get(gid, "unknown")),
+                    "session_date": "",
+                    "role": "unknown",
+                    "content": sample.turns[gid].text if 0 <= gid < len(sample.turns) else "",
+                },
+            )
+        )
+        content_len = len(str(row.get("content", "")))
+        if max_chars > 0 and out and total_chars + content_len > max_chars:
+            continue
+        row["window_turn_id"] = gid
+        row["window_anchor_turn_id"] = anchor_gid
+        row["window_anchor_rank"] = anchor_rank
+        row["window_distance"] = dist
+        row["context_mode"] = "session_window"
+        out.append(row)
+        total_chars += content_len
+    return out
+
+
 def _retrieve_one(
     s: LongMemSample,
     retriever: str,
     k: int,
     graph_topk: int,
     sbert_model: str,
+    graph_session_window: int = 1,
+    graph_session_semantic_topk: int = 0,
     gnn_retriever: GNNRetriever | None = None,
     rerank_pool: int = 20,
     fusion_gnn_weight: float = 0.5,
     fusion_sbert_weight: float = 0.3,
     fusion_bm25_weight: float = 0.2,
     diversify_session_penalty: float = 0.0,
+    answer_pack_weight: float = 0.35,
+    answer_pack_session_penalty: float = 0.05,
 ) -> tuple[list[int], list[dict]]:
     texts = [t.text for t in s.turns]
+    retrieval_meta: dict[int, dict] = {}
     if retriever == "bm25":
         r = BM25Retriever(texts).retrieve(s.question, k=k)
     elif retriever == "sbert":
         r = SBERTRetriever(texts, model_name=sbert_model).retrieve(s.question, k=k)
     elif retriever == "ppr":
-        g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
+        g = build_sentence_graph(
+            s.turns,
+            topk=graph_topk,
+            sbert_model=sbert_model,
+            session_window=graph_session_window,
+            session_semantic_topk=graph_session_semantic_topk,
+        )
         r = PPRRetriever(g, sbert_model=sbert_model).retrieve(s.question, k=k)
     elif retriever == "gnn":
         if gnn_retriever is None:
             raise ValueError("GNN retriever selected but no checkpoint-loaded retriever was provided.")
-        g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
+        g = build_sentence_graph(
+            s.turns,
+            topk=graph_topk,
+            sbert_model=sbert_model,
+            session_window=graph_session_window,
+            session_semantic_topk=graph_session_semantic_topk,
+        )
         r = gnn_retriever.retrieve(s.question, g.to_torch(device=gnn_retriever.device), k=k)
     elif retriever == "gnn+sbert_rerank":
         if gnn_retriever is None:
             raise ValueError("gnn+sbert_rerank selected but no checkpoint-loaded retriever was provided.")
-        g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
+        g = build_sentence_graph(
+            s.turns,
+            topk=graph_topk,
+            sbert_model=sbert_model,
+            session_window=graph_session_window,
+            session_semantic_topk=graph_session_semantic_topk,
+        )
         pool_k = max(k, rerank_pool)
         gnn_ranked = gnn_retriever.retrieve(
             s.question, g.to_torch(device=gnn_retriever.device), k=pool_k
@@ -163,10 +544,16 @@ def _retrieve_one(
         cand_texts = [g.node_texts[i] for i in cand_ids]
         sb_ranked = SBERTRetriever(cand_texts, model_name=sbert_model).retrieve(s.question, k=k)
         r = [(cand_ids[i], score, text) for i, score, text in sb_ranked]
-    elif retriever in ("gnn+fusion_rerank", "gnn+fusion_diverse_rerank"):
+    elif retriever in ("gnn+fusion_rerank", "gnn+fusion_diverse_rerank", "gnn+fusion_answer_pack"):
         if gnn_retriever is None:
             raise ValueError(f"{retriever} selected but no checkpoint-loaded retriever was provided.")
-        g = build_sentence_graph(s.turns, topk=graph_topk, sbert_model=sbert_model)
+        g = build_sentence_graph(
+            s.turns,
+            topk=graph_topk,
+            sbert_model=sbert_model,
+            session_window=graph_session_window,
+            session_semantic_topk=graph_session_semantic_topk,
+        )
         pool_k = max(k, rerank_pool)
         gnn_ranked = gnn_retriever.retrieve(
             s.question, g.to_torch(device=gnn_retriever.device), k=pool_k
@@ -194,6 +581,12 @@ def _retrieve_one(
                 + fusion_sbert_weight * sbert_scores[local_i]
                 + fusion_bm25_weight * bm25_scores[local_i]
             )
+            retrieval_meta[gid] = {
+                "retrieval_score": float(score),
+                "gnn_score": float(gnn_scores[local_i]),
+                "sbert_score": float(sbert_scores[local_i]),
+                "bm25_score": float(bm25_scores[local_i]),
+            }
             fused.append((gid, score, g.node_texts[gid]))
         ranked = sorted(fused, key=lambda x: x[1], reverse=True)
         if retriever == "gnn+fusion_diverse_rerank":
@@ -203,13 +596,39 @@ def _retrieve_one(
                 k=k,
                 penalty=diversify_session_penalty,
             )
+        elif retriever == "gnn+fusion_answer_pack":
+            r = _select_answer_aware_context(
+                s.question,
+                ranked,
+                s.turn_to_session,
+                k=k,
+                pack_weight=answer_pack_weight,
+                session_penalty=answer_pack_session_penalty,
+            )
         else:
             r = ranked[:k]
     else:
         raise ValueError(f"Unsupported retriever: {retriever}")
     ids = [i for i, _, _ in r]
     tm = _build_turn_meta(s)
-    ctx = [tm.get(i, {"session_id": str(s.turn_to_session.get(i, "unknown")), "session_date": "", "role": "unknown", "content": s.turns[i].text if 0 <= i < len(s.turns) else ""}) for i in ids]
+    ctx = []
+    for rank, (i, score, _) in enumerate(r, start=1):
+        row = dict(
+            tm.get(
+                i,
+                {
+                    "session_id": str(s.turn_to_session.get(i, "unknown")),
+                    "session_date": "",
+                    "role": "unknown",
+                    "content": s.turns[i].text if 0 <= i < len(s.turns) else "",
+                },
+            )
+        )
+        row["evidence_rank"] = rank
+        row["retriever"] = retriever
+        row["retrieval_score"] = float(score)
+        row.update(retrieval_meta.get(i, {}))
+        ctx.append(row)
     return ids, ctx
 
 
@@ -226,10 +645,13 @@ def main() -> None:
             "gnn+sbert_rerank",
             "gnn+fusion_rerank",
             "gnn+fusion_diverse_rerank",
+            "gnn+fusion_answer_pack",
         ),
         default="sbert",
     )
     p.add_argument("--checkpoint", default="", help="Required when --retriever gnn")
+    p.add_argument("--gnn-arch", choices=("sage", "sage_res", "sage_skip", "sage_qa", "gat"), default="sage")
+    p.add_argument("--gat-heads", type=int, default=4)
     p.add_argument("--rerank-pool", type=int, default=20)
     p.add_argument("--fusion-gnn-weight", type=float, default=0.5)
     p.add_argument("--fusion-sbert-weight", type=float, default=0.3)
@@ -240,19 +662,65 @@ def main() -> None:
         default=0.15,
         help="Score penalty for selecting additional turns from an already selected session.",
     )
+    p.add_argument(
+        "--answer-pack-weight",
+        type=float,
+        default=0.35,
+        help="Weight for answer-like lexical/type cues in gnn+fusion_answer_pack.",
+    )
+    p.add_argument(
+        "--answer-pack-session-penalty",
+        type=float,
+        default=0.05,
+        help="Small session repeat penalty used by gnn+fusion_answer_pack.",
+    )
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--graph-topk", type=int, default=5)
+    p.add_argument(
+        "--graph-session-window",
+        type=int,
+        default=1,
+        help="Connect turns within this same-session distance; 1 keeps the legacy chain graph.",
+    )
+    p.add_argument(
+        "--graph-session-semantic-topk",
+        type=int,
+        default=0,
+        help="Add this many same-session semantic neighbors per node; 0 keeps legacy graph.",
+    )
     p.add_argument("--sbert-model", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--sbert-local-only", action="store_true")
     p.add_argument("--reader-backend", choices=("vllm", "transformers"), default="vllm")
     p.add_argument("--reader-model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--reader-batch-size", type=int, default=16)
+    p.add_argument(
+        "--reader-prompt-mode",
+        choices=("plain", "ranked", "retrieval_aware"),
+        default="plain",
+        help="Prompt format used by the reader.",
+    )
+    p.add_argument(
+        "--context-mode",
+        choices=("full", "sentence_pack", "session_window"),
+        default="full",
+        help="Optional reader-side context compression after retrieval.",
+    )
+    p.add_argument("--context-sentences-per-turn", type=int, default=2)
+    p.add_argument("--context-max-chars", type=int, default=1400)
+    p.add_argument("--window-radius", type=int, default=1)
+    p.add_argument("--window-max-turns", type=int, default=12)
+    p.add_argument("--window-max-chars", type=int, default=9000)
     p.add_argument("--judge-backend", choices=("siliconflow", "deepseek", "local_vllm"), default="siliconflow")
     p.add_argument("--judge-concurrency", type=int, default=10)
     p.add_argument("--judge-cache-dir", default="data/processed/judge_cache")
     p.add_argument("--judge-max-retries", type=int, default=3)
+    p.add_argument(
+        "--no-save-contexts",
+        action="store_true",
+        help="Do not store retrieved context text in per-question audit output.",
+    )
     p.add_argument("--output", default="experiments/results/full_eval.json")
     args = p.parse_args()
 
@@ -278,6 +746,7 @@ def main() -> None:
         "gnn+sbert_rerank",
         "gnn+fusion_rerank",
         "gnn+fusion_diverse_rerank",
+        "gnn+fusion_answer_pack",
     ):
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required when --retriever gnn")
@@ -289,7 +758,14 @@ def main() -> None:
                 def __init__(self, sbert_name: str):
                     self.device = "cuda" if torch.cuda.is_available() else "cpu"
                     self.sbert = SentenceTransformer(sbert_name, device=self.device)
-                    self.model = QueryGNN(in_dim=384, hidden_dim=256, num_layers=2, query_dim=384).to(self.device)
+                    self.model = QueryGNN(
+                        in_dim=384,
+                        hidden_dim=256,
+                        num_layers=2,
+                        query_dim=384,
+                        arch=args.gnn_arch,
+                        gat_heads=args.gat_heads,
+                    ).to(self.device)
                     self.model.eval()
                 @torch.no_grad()
                 def retrieve(self, query: str, graph_data: dict, k: int = 5):
@@ -317,6 +793,8 @@ def main() -> None:
             gnn_retriever = GNNRetriever(
                 model_path=args.checkpoint,
                 sbert_name=sbert_model,
+                arch=args.gnn_arch,
+                gat_heads=args.gat_heads,
             )
             first_param = next(gnn_retriever.model.parameters())
             print(f"[sanity] loaded model first_param sum={first_param.float().sum().item():.4f}")
@@ -331,19 +809,48 @@ def main() -> None:
             args.k,
             args.graph_topk,
             sbert_model,
+            graph_session_window=args.graph_session_window,
+            graph_session_semantic_topk=args.graph_session_semantic_topk,
             gnn_retriever=gnn_retriever,
             rerank_pool=args.rerank_pool,
             fusion_gnn_weight=args.fusion_gnn_weight,
             fusion_sbert_weight=args.fusion_sbert_weight,
             fusion_bm25_weight=args.fusion_bm25_weight,
             diversify_session_penalty=args.diversify_session_penalty,
+            answer_pack_weight=args.answer_pack_weight,
+            answer_pack_session_penalty=args.answer_pack_session_penalty,
         )
         retrieved_ids.append(ids)
         contexts.append(ctx)
+    if args.context_mode == "sentence_pack":
+        contexts = [
+            _compress_contexts_for_reader(
+                s.question,
+                ctx,
+                sentences_per_turn=args.context_sentences_per_turn,
+                max_chars=args.context_max_chars,
+            )
+            for s, ctx in zip(subset, contexts)
+        ]
+    elif args.context_mode == "session_window":
+        contexts = [
+            _expand_contexts_session_window(
+                s,
+                ids,
+                window_radius=args.window_radius,
+                max_turns=args.window_max_turns,
+                max_chars=args.window_max_chars,
+            )
+            for s, ids in zip(subset, retrieved_ids)
+        ]
     t_retr = time.time() - t_retr_start
 
     t_reader_start = time.time()
-    reader = QwenReader(model_name=args.reader_model, backend=args.reader_backend)
+    reader = QwenReader(
+        model_name=args.reader_model,
+        backend=args.reader_backend,
+        prompt_mode=args.reader_prompt_mode,
+    )
     if subset:
         sample_prompt = reader._build_prompt(
             question=subset[0].question,
@@ -384,37 +891,62 @@ def main() -> None:
     all_h: list[float] = []
     all_sr: list[float] = []
     all_mrr: list[float] = []
+    all_answer_ctx: list[float] = []
+    all_idk: list[float] = []
+    all_empty: list[float] = []
+    all_judge_err: list[float] = []
+    all_lexical_match: list[float] = []
 
-    for s, rid, pred, jo in zip(subset, retrieved_ids, preds, judge_out):
+    for s, rid, ctx, pred, jo in zip(subset, retrieved_ids, contexts, preds, judge_out):
         pos = set(s.evidence_global_ids)
         sr = session_recall_at_k(rid, s.turn_to_session, s.gold_sessions, args.k)
         rr = recall_at_k(rid, pos, args.k)
         hh = hit_at_k(rid, pos, args.k)
         mr = mrr(rid, pos)
         correct = bool(jo.get("correct", False))
+        answer_ctx = _answer_in_context(s.answer, ctx)
+        idk = _is_idk(pred)
+        empty = not str(pred or "").strip()
+        judge_err = "judge_error" in str(jo.get("reasoning", ""))
+        lexical_match = _lexical_answer_match(s.answer, pred)
         all_acc.append(1.0 if correct else 0.0)
         all_r.append(rr)
         all_h.append(hh)
         all_sr.append(sr)
         all_mrr.append(mr)
+        all_answer_ctx.append(1.0 if answer_ctx else 0.0)
+        all_idk.append(1.0 if idk else 0.0)
+        all_empty.append(1.0 if empty else 0.0)
+        all_judge_err.append(1.0 if judge_err else 0.0)
+        all_lexical_match.append(1.0 if lexical_match else 0.0)
         by_type_acc[s.question_type].append(1.0 if correct else 0.0)
         by_type_sessr[s.question_type].append(sr)
-        per_question.append(
-            {
-                "qid": s.question_id,
-                "question_type": s.question_type,
-                "question": s.question,
-                "gold": s.answer,
-                "predicted": pred,
-                "correct": correct,
-                "retrieved_turn_ids": rid,
-                "retrieved_sessions": [
-                    s.turn_to_session[i] for i in rid if i in s.turn_to_session
-                ],
-                "sess_recall_at_5": sr,
-                "judge_reasoning": jo.get("reasoning", ""),
-            }
-        )
+        row = {
+            "qid": s.question_id,
+            "question_type": s.question_type,
+            "question": s.question,
+            "gold": s.answer,
+            "predicted": pred,
+            "correct": correct,
+            "retrieved_turn_ids": rid,
+            "retrieved_sessions": [
+                s.turn_to_session[i] for i in rid if i in s.turn_to_session
+            ],
+            "sess_recall_at_5": sr,
+            "recall_at_5": rr,
+            "hit_at_5": hh,
+            "mrr": mr,
+            "answer_in_context_at_5": answer_ctx,
+            "idk_prediction": idk,
+            "empty_prediction": empty,
+            "lexical_answer_match": lexical_match,
+            "judge_cached": bool(jo.get("cached", False)),
+            "judge_reasoning": jo.get("reasoning", ""),
+            "judge_raw_response": jo.get("raw_response", ""),
+        }
+        if not args.no_save_contexts:
+            row["retrieved_contexts"] = ctx
+        per_question.append(row)
 
     def _mean(xs: list[float]) -> float:
         return sum(xs) / max(len(xs), 1)
@@ -433,9 +965,21 @@ def main() -> None:
             "limit": args.limit,
             "k": args.k,
             "seed": args.seed,
+            "graph_topk": args.graph_topk,
+            "graph_session_window": args.graph_session_window,
+            "graph_session_semantic_topk": args.graph_session_semantic_topk,
             "reader_backend": args.reader_backend,
             "reader_model": args.reader_model,
+            "reader_prompt_mode": args.reader_prompt_mode,
             "judge_backend": args.judge_backend,
+            "answer_pack_weight": args.answer_pack_weight,
+            "answer_pack_session_penalty": args.answer_pack_session_penalty,
+            "context_mode": args.context_mode,
+            "context_sentences_per_turn": args.context_sentences_per_turn,
+            "context_max_chars": args.context_max_chars,
+            "window_radius": args.window_radius,
+            "window_max_turns": args.window_max_turns,
+            "window_max_chars": args.window_max_chars,
         },
         "overall": {
             "accuracy": _mean(all_acc),
@@ -443,6 +987,11 @@ def main() -> None:
             "recall_at_5": _mean(all_r),
             "hit_at_5": _mean(all_h),
             "mrr": _mean(all_mrr),
+            "answer_in_context_at_5": _mean(all_answer_ctx),
+            "idk_rate": _mean(all_idk),
+            "empty_prediction_rate": _mean(all_empty),
+            "judge_error_rate": _mean(all_judge_err),
+            "lexical_answer_match_rate": _mean(all_lexical_match),
             "n": len(subset),
         },
         "by_type": by_type,
@@ -450,6 +999,10 @@ def main() -> None:
         "stats": {
             **judge.stats(),
             "avg_predicted_words": _mean([len(str(p).split()) for p in preds]),
+            "audit_note": (
+                "answer_in_context_at_5 uses normalized exact substring matching "
+                "for gold answers up to 120 characters; long/free-form answers are counted false."
+            ),
             "retrieval_latency_sec": round(t_retr, 4),
             "reader_latency_sec": round(t_reader, 4),
             "judge_latency_sec": round(t_judge, 4),
@@ -468,6 +1021,11 @@ def main() -> None:
     print(
         f"judge cache hit={out_obj['stats']['judge_cache_hit_rate']:.3f} "
         f"est_cost_cny={out_obj['stats']['est_cost_cny']}"
+    )
+    print(
+        f"audit answer_ctx@5={out_obj['overall']['answer_in_context_at_5']:.3f} "
+        f"idk={out_obj['overall']['idk_rate']:.3f} "
+        f"judge_err={out_obj['overall']['judge_error_rate']:.3f}"
     )
 
 

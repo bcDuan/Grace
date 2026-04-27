@@ -258,6 +258,8 @@ def main() -> None:
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--gnn_arch", choices=("sage", "sage_res", "sage_skip", "sage_qa", "gat"), default="sage")
+    p.add_argument("--gat_heads", type=int, default=4)
     p.add_argument("--lam", type=float, default=0.5)
     p.add_argument("--neg_ratio", type=int, default=4, help="Negative sampling ratio for BCE.")
     p.add_argument(
@@ -287,6 +289,18 @@ def main() -> None:
     p.add_argument("--out", default="experiments/checkpoints/gnn.pt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--topk_graph", type=int, default=5)
+    p.add_argument(
+        "--graph_session_window",
+        type=int,
+        default=1,
+        help="Connect turns within this same-session distance; 1 keeps the legacy chain graph.",
+    )
+    p.add_argument(
+        "--graph_session_semantic_topk",
+        type=int,
+        default=0,
+        help="Add this many same-session semantic neighbors per node; 0 keeps legacy graph.",
+    )
     p.add_argument("--sbert", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--val_limit", type=int, default=30)
     p.add_argument(
@@ -312,6 +326,12 @@ def main() -> None:
     p.add_argument("--reader_batch_size", type=int, default=2)
     p.add_argument("--judge_backend", choices=("siliconflow", "deepseek", "local_vllm"), default="siliconflow")
     p.add_argument("--judge_cache_dir", default="data/processed/judge_cache")
+    p.add_argument(
+        "--best_metric",
+        choices=("r5", "strong_hit", "qa_acc"),
+        default="r5",
+        help="Metric used only for BEST_EPOCH_BY_METRIC logging; all epoch checkpoints are still saved.",
+    )
     p.add_argument(
         "--skip_qa_eval",
         action="store_true",
@@ -341,12 +361,16 @@ def main() -> None:
         topk=args.topk_graph,
         sbert=args.sbert,
         weak_positive_weight=args.weak_positive_weight,
+        session_window=args.graph_session_window,
+        session_semantic_topk=args.graph_session_semantic_topk,
     )
     val_rows = longmem_samples_to_graph_rows(
         val_s_for_rows,
         topk=args.topk_graph,
         sbert=args.sbert,
         weak_positive_weight=args.weak_positive_weight,
+        session_window=args.graph_session_window,
+        session_semantic_topk=args.graph_session_semantic_topk,
     )
     if not train_rows:
         print("No training rows (missing evidence or empty turns).")
@@ -366,6 +390,10 @@ def main() -> None:
         f"[label] val_rows={len(val_rows)} strong_rows={val_strong} "
         f"strong_rate={val_strong / max(len(val_rows), 1):.3f}"
     )
+    print(
+        f"[graph] topk={args.topk_graph} session_window={args.graph_session_window} "
+        f"session_semantic_topk={args.graph_session_semantic_topk}"
+    )
     train_ds = GraphMatchDataset(train_rows, sbert=None)
     val_ds = GraphMatchDataset(val_rows, sbert=None)
     train_loader = DataLoader(
@@ -375,7 +403,12 @@ def main() -> None:
         val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate
     )
     model = QueryGNN(
-        in_dim=384, hidden_dim=args.hidden, num_layers=args.num_layers, query_dim=384
+        in_dim=384,
+        hidden_dim=args.hidden,
+        num_layers=args.num_layers,
+        query_dim=384,
+        arch=args.gnn_arch,
+        gat_heads=args.gat_heads,
     ).to(device)
     if args.resume_checkpoint:
         state = torch.load(args.resume_checkpoint, map_location=device)
@@ -387,7 +420,13 @@ def main() -> None:
     val_subset = stratified_sample(val_evalable, args.val_limit, seed=args.val_seed)
     val_graphs = []
     for s in val_subset:
-        g = build_sentence_graph(s.turns, topk=args.topk_graph, sbert_model=args.sbert)
+        g = build_sentence_graph(
+            s.turns,
+            topk=args.topk_graph,
+            sbert_model=args.sbert,
+            session_window=args.graph_session_window,
+            session_semantic_topk=args.graph_session_semantic_topk,
+        )
         td = g.to_torch(device="cpu")
         val_graphs.append(
             {
@@ -441,7 +480,12 @@ def main() -> None:
                 k=5,
                 reader_batch_size=args.reader_batch_size,
             )
-        metric = r5 if args.skip_qa_eval else val_acc
+        if args.best_metric == "strong_hit":
+            metric = strong_h5
+        elif args.best_metric == "qa_acc":
+            metric = val_acc
+        else:
+            metric = r5 if args.skip_qa_eval else val_acc
         if np.isnan(metric):
             tag = ""
         elif metric > best_metric:
@@ -472,7 +516,10 @@ def main() -> None:
             print(f"[info] epoch {args.epochs} is current best; extending training to {max_epochs} epochs.")
         epoch += 1
 
-    print(f"BEST_EPOCH_BY_METRIC: epoch {best_epoch}, metric={best_metric:.3f}")
+    print(
+        f"BEST_EPOCH_BY_METRIC: epoch {best_epoch}, "
+        f"metric={best_metric:.3f}, metric_name={args.best_metric}"
+    )
     curve_path = Path(args.curve_out)
     curve_path.parent.mkdir(parents=True, exist_ok=True)
     curve_path.write_text(

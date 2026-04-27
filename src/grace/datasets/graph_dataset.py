@@ -119,12 +119,20 @@ def longmem_samples_to_graph_rows(
     topk: int = 5,
     sbert: str = "sentence-transformers/all-MiniLM-L6-v2",
     weak_positive_weight: float = 0.2,
+    session_window: int = 1,
+    session_semantic_topk: int = 0,
 ) -> list[GraphRow]:
     out: list[GraphRow] = []
     for s in samples:
         if not s.turns:
             continue
-        g = build_sentence_graph(s.turns, topk=topk, sbert_model=sbert)
+        g = build_sentence_graph(
+            s.turns,
+            topk=topk,
+            sbert_model=sbert,
+            session_window=session_window,
+            session_semantic_topk=session_semantic_topk,
+        )
         n = len(g.node_texts)
         mask = np.zeros(n, dtype=bool)
         for gid in s.evidence_global_ids:
